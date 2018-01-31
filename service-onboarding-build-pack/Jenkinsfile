@@ -35,6 +35,7 @@ def Event_Status = [
 @Field def scm_base = ''
 @Field def cas_proj_id = ''
 @Field def owner = ''
+@Field def scmModule
 
 node  {
 	def service_template
@@ -48,6 +49,7 @@ node  {
 	def scm_repo_name 				= params.service_name
 	def domain		                = params.domain
 
+	def buildModuleUrl = "http://${env.REPO_BASE}/scm/${env.REPO_CORE}/jazz-build-module.git"
 	def scm				            = env.JAZZ_SCM
 	def repo_protocol				= "http://"
 	def var_credentialsId 			= env.REPO_CREDENTIAL_ID
@@ -55,7 +57,6 @@ node  {
 	def var_api_key 				= env.API_KEY
 	def var_api_host_name			= var_api_key+".execute-api.us-east-2.amazonaws.com"
 	def cas_rest_repo 			    = repo_protocol + repo_base  + "/rest/api/1.0/projects/" + env.REPO_LOC + "/repos"
-	def cas_repo_id 			= getCasRepoId()
 	def var_bitbucket_email 		= env.REPO_EMAIL
 
 	def var_bitbucket_branch_perm	= repo_protocol + repo_base + "/rest/branch-permissions/2.0/projects/" + env.REPO_LOC + "/repos/"
@@ -63,9 +64,9 @@ node  {
 	def jenkins_url                 = JenkinsLocationConfiguration.get().getUrl()
 	def scmscource_hook  	= jenkins_url + "/bitbucket-scmsource-hook/notify"
 
-
+	loadScmModule(buildModuleUrl, scm, repo_base)
 	//Setting SCM Repo
-	setSCMBase(scm, env.REPO_BASE)
+	scm_base = scmModule.setSCMBase()
 
 	def var_cas_clone_url	 		= scm_base + env.REPO_LOC + "/"
 	def var_serviceonboarding_repo 	= repo_protocol + scm_base + env.REPO_CORE + "/service-onboarding-build-pack.git"
@@ -84,7 +85,7 @@ node  {
 		domain = params.domain.trim()
 	}
 
-	def repo_url = setRepoUrl(scm, repo_protocol, scm_repo_name, repo_base)
+	def repo_url = scmModule.setRepoUrl(repo_protocol, scm_repo_name)
 
 	stage('Input Validation')
 	{
@@ -99,6 +100,16 @@ node  {
 		if(admin_group == "" ) {
 			sendEvent(service_type, service_name, domain, runtime, admin_group, Event_Name.VALIDATE_INPUT, Event_Status.FAILED, "Invalid Admin Group")
 			//error "Invalid Admin Group"
+		}
+
+		if(scm == null || scm.isEmpty()){
+			sendEvent(service_type, service_name, domain, runtime, admin_group, Event_Name.VALIDATE_INPUT, Event_Status.FAILED, "Invalid SCM")
+			error "scm is not defined"
+		}
+
+		if(!scm.equals("bitbucket") && !scm.equals("gitlab")){
+			sendEvent(service_type, service_name, domain, runtime, admin_group, Event_Name.VALIDATE_INPUT, Event_Status.FAILED, "Invalid SCM")
+			error "scm host is not currently supported"
 		}
 
 		if(service_type == "api" || service_type == "lambda" || service_type == "function" || service_type == "website" ) {
@@ -289,8 +300,7 @@ node  {
 		{
 			try{
 				withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: var_credentialsId, passwordVariable: 'PWD', usernameVariable: 'UNAME']]) {
-					createProjectInSCM(scm, env.gitlab_private_token, env.gitlab_cas_name_space_id, repo_base, scm_repo_name, uname, pwd, cas_rest_repo)
-
+					scmModule.createProjectInSCM(env.gitlab_private_token, owner, scm_repo_name, cas_rest_repo, env.REPO_LOC, uname, pwd)
 					sh "git config --global user.email \"" + var_bitbucket_email + "\""
 					sh "git config --global user.name $UNAME"
 				}
@@ -447,123 +457,6 @@ node  {
 	}
 }
 
-def setSCMBase(scm, repo_base)
-{
-	scm_base = repo_base + "/"
-	if (scm == 'bitbucket')
-	{
-		scm_base = scm_base + "scm/"
-	}
-}
-
-def setRepoUrl(scm, repo_protocol, scm_repo_name, repo_base)
-{
-	def repo_url = repo_protocol
-	if (scm == "gitlab"){
-		repo_url = repo_url + scm_base + "/cas/" + scm_repo_name
-	}else{
-		repo_url = repo_url + repo_base + "/projects/CAS/repos/" + scm_repo_name + "/browse";
-	}
-	return repo_url
-}
-
-def createProjectInSCM(scm, gitlab_private_token, gitlab_cas_name_space_id, repo_base, scm_repo_name, username, password, cas_rest_repo){
-	try{
-		if(scm == "gitlab"){
-			def private_token    = gitlab_private_token
-			def cas_namespace_id = gitlab_cas_name_space_id
-			def git_username
-			//assuming usernames for now are a concatination of the user's email, check platform_usermanagement index.js
-			if(owner.contains("@")){
-				git_username = owner.substring(0, owner.indexOf("@"))
-			}
-			def user_id = getGitlabUserId(git_username, private_token)
-			def gitlab_repo_output = sh (
-				script: "curl --header \"Private-Token: $private_token\" -X POST \"http://$repo_base/api/v3/projects/user/$user_id?name=$scm_repo_name&path=$scm_repo_name&visibility=private&request_access_enabled=true\"",
-				returnStdout: true
-			).trim()
-
-			def jsonSlurper = new JsonSlurper()
-			def object = jsonSlurper.parseText(gitlab_repo_output)
-			if(object == null || object.equals("") || object.id == null || object.id.equals("")){
-				error "new project creation failed"
-			}
-			cas_proj_id = object.id
-			cas_repo_id = getCasRepoId()
-			transferProject(cas_repo_id, cas_proj_id)
-		}
-		else if(scm == "bitbucket"){
-			sh "curl -X POST -k -v -u \"$username:$password\" -H \"Content-Type: application/json\" " + cas_rest_repo + " -d \'{\"name\":\""+ scm_repo_name +"\", \"scmId\": \"git\", \"forkable\": \"true\"}\'"
-		}
-		else if(scm == null || scm.isEmpty()){
-			error "scm host is not defined"
-		}
-	}catch (ex) {
-		if(!((ex.getMessage()).indexOf("groovy.json.internal.LazyMap") > -1)) {
-			sendEvent(service_type, service_name, domain, runtime, admin_group, Event_Name.CREATE_SERVICE_REPO, Event_Status.FAILED, "createProjectInSCM failed")
-			error "createProjectInSCM Failed. "+ex.getMessage()
-		} else {
-			//events.sendCompletedEvent('VALIDATE_PRE_BUILD_CONF', "Service exists for deletion")
-		}
-	}
-}
-
-def getGitlabUserId(username, private_token){
-	try{
-		def output = sh (
-			script: "curl --header \"Private-Token: $private_token\" -X GET \"http://$repo_base/api/v3/users?username=$username\"",
-			returnStdout: true
-		).trim()
-		def jsonSlurper = new JsonSlurper()
-		def userObject = jsonSlurper.parseText(output)
-		if(userObject == null || userObject.equals("") || userObject[0] == null || userObject[0].equals("") ||
-				userObject[0].id == null || userObject[0].id.equals("")){
-			error "get user data in gitlab failed"
-		}
-		return userObject[0].id
-	}catch (ex) {
-		if(!((ex.getMessage()).indexOf("groovy.json.internal.LazyMap") > -1)) {
-			sendEvent(service_type, service_name, domain, runtime, admin_group, Event_Name.CREATE_SERVICE_REPO, Event_Status.FAILED, "getGitlabUserId failed")
-			error "getGitlabUserId Failed. "+ex.getMessage()
-		} else {
-			//events.sendCompletedEvent('VALIDATE_PRE_BUILD_CONF', "Service exists for deletion")
-		}
-	}
-}
-
-def getCasRepoId(){
-	try{
-		def output = sh (
-			script: "curl --header \"Private-Token: ${env.gitlab_private_token}\" -X GET \"http://$repo_base/api/v3/groups?search=${env.REPO_LOC}\"",
-			returnStdout: true
-		).trim()
-		def jsonSlurper = new JsonSlurper()
-		def groupObject = jsonSlurper.parseText(output)
-		if(groupObject == null || groupObject.equals("") || groupObject[0] == null || groupObject[0].equals("") ||
-				groupObject[0].id == null || groupObject[0].id.equals("")){
-					error "get cas group data failed"
-		}
-		return groupObject[0].id
-	}catch (ex) {
-		if(!((ex.getMessage()).indexOf("groovy.json.internal.LazyMap") > -1)) {
-			sendEvent(service_type, service_name, domain, runtime, admin_group, Event_Name.CREATE_SERVICE_REPO, Event_Status.FAILED, "getCasRepoId failed")
-			error "getCasRepoId Failed. "+ex.getMessage()
-		} else {
-			//events.sendCompletedEvent('VALIDATE_PRE_BUILD_CONF', "Service exists for deletion")
-		}
-	}
-}
-
-def transferProject(cas_id, project_id){
-
-	def output = sh (
-		script: "curl --header \"Private-Token: $private_token\" -X POST \"http://$repo_base/api/v3/groups/$cas_id/projects/$project_id\"",
-		returnStdout: true
-	).trim()
-
-}
-
-
 def sendEvent(service_type, service_name, domain, runtime, admin_group, event_name, event_status, error){
 	echo "send event" + error
 }
@@ -688,4 +581,25 @@ def send_status_email (email_id, build_status, service, domain) {
    } catch (e){
        echo "Failed while sending build status notification"
    }
+}
+
+/*
+* Load some crud functionality for gitlab resources
+*/
+def loadScmModule(buildModuleUrl, scm, repo_base){
+	echo "loading scm-module - checking for jazz-build-module..."
+
+	dir('scm-module') {
+		checkout([$class: 'GitSCM', branches: [
+			[name: '*/master']
+		], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [
+			[credentialsId: env.REPO_CREDENTIAL_ID, url: buildModuleUrl]
+		]])
+
+		echo "loading scm-module from jazz-build-module..."
+
+		scmModule = load "scm-module.groovy"
+		scmModule.initialize(scm, repo_base)
+		echo "finished loading scm-module"
+	}
 }
